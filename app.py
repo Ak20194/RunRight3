@@ -1322,12 +1322,12 @@ elif page == "📈  ARIMA Forecasting":
         # Revenue
         monthly_revenue = monthly_spend * monthly_mau / 1000
 
-        return pd.DataFrame({
-            'Date': months,
+        df_out = pd.DataFrame({
             'Avg_Monthly_Spend_AED': monthly_spend.clip(0),
-            'MAU': monthly_mau.clip(0).astype(int),
+            'MAU': monthly_mau.clip(0).astype(float),
             'Monthly_Revenue_AED': monthly_revenue.clip(0)
-        }).set_index('Date')
+        }, index=pd.DatetimeIndex(months, freq='MS'))
+        return df_out
 
     df_ts = build_monthly_series()
 
@@ -1386,75 +1386,95 @@ elif page == "📈  ARIMA Forecasting":
                                    'Monthly_Revenue_AED':'Monthly Revenue (AED)'}[x],
             key='arima_metric')
 
-        series = df_ts[metric_arima].copy()
+        # Ensure float series with clean DatetimeIndex frequency
+        series_raw = df_ts[metric_arima].copy().astype(float)
+        series_raw.index = pd.DatetimeIndex(series_raw.index, freq='MS')
 
         if arima_available:
             try:
-                model = ARIMA(series, order=(p_order, d_order, q_order))
+                import warnings
+                warnings.filterwarnings('ignore')
+                model = ARIMA(series_raw, order=(p_order, d_order, q_order))
                 result = model.fit()
                 forecast = result.get_forecast(steps=n_forecast)
                 fc_mean = forecast.predicted_mean
-                fc_ci = forecast.conf_int(alpha=0.05)
-                future_idx = pd.date_range(series.index[-1] + pd.DateOffset(months=1),
-                                           periods=n_forecast, freq='MS')
+                fc_ci   = forecast.conf_int(alpha=0.05)
+                # Build future index safely from integer offset
+                last_ts = series_raw.index[-1]
+                future_idx = pd.date_range(
+                    start=last_ts + pd.DateOffset(months=1),
+                    periods=n_forecast, freq='MS'
+                )
+                fc_mean.index = future_idx
+                fc_ci.index   = future_idx
 
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=series.index, y=series, mode='lines+markers',
-                                         name='Historical', line=dict(color='#38bdf8', width=2)))
-                fig.add_trace(go.Scatter(x=future_idx, y=fc_mean,
-                                         mode='lines+markers', name='Forecast',
-                                         line=dict(color='#22c55e', width=2.5)))
                 fig.add_trace(go.Scatter(
-                    x=list(future_idx) + list(future_idx[::-1]),
-                    y=list(fc_ci.iloc[:,1]) + list(fc_ci.iloc[:,0][::-1]),
+                    x=series_raw.index.strftime('%Y-%m'),
+                    y=series_raw.values,
+                    mode='lines+markers', name='Historical',
+                    line=dict(color='#38bdf8', width=2)))
+                fig.add_trace(go.Scatter(
+                    x=future_idx.strftime('%Y-%m'),
+                    y=fc_mean.values,
+                    mode='lines+markers', name='Forecast',
+                    line=dict(color='#22c55e', width=2.5)))
+                fig.add_trace(go.Scatter(
+                    x=list(future_idx.strftime('%Y-%m')) + list(future_idx.strftime('%Y-%m')[::-1]),
+                    y=list(fc_ci.iloc[:,1].values) + list(fc_ci.iloc[:,0].values[::-1]),
                     fill='toself', fillcolor='rgba(34,197,94,0.1)',
-                    line=dict(color='rgba(34,197,94,0)'), name='95% CI'))
-                fig.add_vline(x=str(series.index[-1]), line_dash='dash', line_color='#f59e0b',
-                              annotation_text='Forecast start')
-                fig.update_layout(height=480, xaxis_title='Month',
+                    line=dict(color='rgba(34,197,94,0)'), name='95% CI',
+                    showlegend=True))
+                split_label = last_ts.strftime('%Y-%m')
+                fig.add_vline(x=split_label, line_dash='dash', line_color='#f59e0b',
+                              annotation_text='Forecast start', annotation_position='top right')
+                fig.update_layout(height=500, xaxis_title='Month',
                                   yaxis_title=metric_arima.replace('_',' '),
-                                  legend=dict(orientation='h', y=1.05))
+                                  legend=dict(orientation='h', y=1.08))
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Model metrics
-                mc1,mc2,mc3,mc4 = st.columns(4)
+                mc1, mc2, mc3, mc4 = st.columns(4)
                 mc1.metric("AIC", f"{result.aic:.1f}")
                 mc2.metric("BIC", f"{result.bic:.1f}")
-                mc3.metric(f"Forecast +{n_forecast}mo", f"{fc_mean.iloc[-1]:.1f}")
+                mc3.metric(f"+{n_forecast}mo forecast", f"{fc_mean.iloc[-1]:.1f}")
                 mc4.metric("95% CI width", f"±{(fc_ci.iloc[-1,1]-fc_ci.iloc[-1,0])/2:.1f}")
 
-                st.caption(f"ARIMA({p_order},{d_order},{q_order}) | AIC={result.aic:.1f} | BIC={result.bic:.1f}")
-                with st.expander("Model Summary"):
+                st.caption(f"ARIMA({p_order},{d_order},{q_order}) · AIC={result.aic:.1f} · BIC={result.bic:.1f}")
+                with st.expander("View Full Model Summary"):
                     st.text(str(result.summary()))
 
             except Exception as e:
-                st.error(f"ARIMA fitting error: {e}. Try different p,d,q values.")
+                st.error(f"ARIMA fitting error: {e}. Try adjusting p, d, or q above.")
+                st.info("Common fixes: set d=1 if series is non-stationary · set p=1,q=0 as a baseline · avoid p+q > 3 for short series.")
         else:
             # Fallback: simple exponential smoothing forecast
             st.warning("statsmodels not found — showing Exponential Smoothing forecast instead. The Streamlit Cloud deployment will use full ARIMA via requirements.txt.")
             alpha = 0.3
-            smoothed = [series.iloc[0]]
-            for v in series.iloc[1:]:
-                smoothed.append(alpha * v + (1-alpha) * smoothed[-1])
+            series_fb = series_raw.astype(float)
+            smoothed = [float(series_fb.iloc[0])]
+            for v in series_fb.iloc[1:]:
+                smoothed.append(alpha * float(v) + (1-alpha) * smoothed[-1])
             last = smoothed[-1]
             growth = (smoothed[-1] - smoothed[-6]) / 6 if len(smoothed) >= 6 else 0
-            future_idx = pd.date_range(series.index[-1] + pd.DateOffset(months=1),
-                                       periods=n_forecast, freq='MS')
+            future_idx = pd.date_range(
+                start=series_raw.index[-1] + pd.DateOffset(months=1),
+                periods=n_forecast, freq='MS')
+            series = series_raw  # use cleaned series for fallback
             fc_vals = [last + growth * (i+1) for i in range(n_forecast)]
             ci_width = series.std() * 1.96
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=series.index, y=series, mode='lines+markers',
+            fig.add_trace(go.Scatter(x=series_fb.index.strftime('%Y-%m'), y=series_fb.values, mode='lines+markers',
                                      name='Historical', line=dict(color='#38bdf8', width=2)))
-            fig.add_trace(go.Scatter(x=series.index, y=smoothed, mode='lines',
+            fig.add_trace(go.Scatter(x=series_fb.index.strftime('%Y-%m'), y=smoothed, mode='lines',
                                      name='Smoothed (α=0.3)', line=dict(color='#f59e0b', width=1.5, dash='dot')))
-            fig.add_trace(go.Scatter(x=future_idx, y=fc_vals, mode='lines+markers',
+            fig.add_trace(go.Scatter(x=future_idx.strftime('%Y-%m'), y=fc_vals, mode='lines+markers',
                                      name='Forecast', line=dict(color='#22c55e', width=2.5)))
             fig.add_trace(go.Scatter(
-                x=list(future_idx) + list(future_idx[::-1]),
+                x=list(future_idx.strftime('%Y-%m')) + list(future_idx.strftime('%Y-%m')[::-1]),
                 y=[v+ci_width for v in fc_vals] + [v-ci_width for v in fc_vals[::-1]],
                 fill='toself', fillcolor='rgba(34,197,94,0.12)',
                 line=dict(color='rgba(0,0,0,0)'), name='±1.96σ CI'))
-            fig.add_vline(x=str(series.index[-1]), line_dash='dash', line_color='#f59e0b')
+            fig.add_vline(x=series_fb.index[-1].strftime('%Y-%m'), line_dash='dash', line_color='#f59e0b')
             fig.update_layout(height=480, legend=dict(orientation='h', y=1.05))
             st.plotly_chart(fig, use_container_width=True)
 
